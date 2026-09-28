@@ -4,7 +4,7 @@ ArcGIS Pro Python toolbox that builds height rasters for an area of interest fro
 Lantmäteriet's Laserdata Nedladdning, skog, and optionally saves the points as LAZ or LAS.
 Each product has its own checkbox:
 
-- **DSM** (ytmodell): highest point per cell.
+- **DSM** (ytmodell): highest point near each cell centre.
 - **DTM** (markmodell): ground points triangulated and rasterised, so it has no gaps.
 - **Höjdskillnad**: DSM minus DTM, in practice vegetation and building height. Negative values
   are set to 0.
@@ -69,6 +69,24 @@ The run is split into numbered steps shown in the progress bar and the messages.
 one at a time with `Ruta k av n` and an estimate of the time left, based on the point count
 Lantmäteriet publishes per tile. Building the DSM and DTM are single PDAL calls with no internal
 progress. The message names the step and the number of points instead.
+
+## How each product is made
+
+The rasters use only the position (X, Y, Z) and the classification of each point. Intensity,
+return number and the other attributes are kept in the point files but not used.
+
+Points are read tile by tile inside the area's bounding box plus a 20 m margin, so cells at the
+edge have full support. Classes 7 (low noise) and 18 (high noise) are removed before any raster
+is built. All rasters share one grid and are clipped to the polygon or extent at the end.
+
+| Product | Points used | Cell value |
+|---|---|---|
+| DSM | All classes except noise, all returns | Highest point within cell size x √2 of the cell centre (1.41 m at 1 m cells). A single high point therefore also raises the four adjacent cells, which slightly widens crowns. Cells with no point that close are filled by inverse distance weighting from cells up to 3 cells away. Larger gaps stay NoData, typically open water, which returns no pulses |
+| DTM | Class 2 (mark) only | Ground points are triangulated into a TIN, and each cell gets the TIN's height at the cell centre. No gaps: where ground points are missing, under dense canopy, buildings or water, the height is linearly interpolated across |
+| Höjdskillnad | The DSM and DTM | DSM minus DTM per cell. Negative values, where the highest point lies below the ground surface, are measurement noise and set to 0. NoData where the DSM is NoData |
+| Punktfiler | Everything read | Written unchanged, one file per tile: all classes including noise, all attributes. Cut to the bounding box plus margin, not to the polygon |
+
+The same description is in each checkbox's tooltip and in each raster's metadata.
 
 ## About the data
 

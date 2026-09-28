@@ -36,9 +36,11 @@ Rutorna läses en i taget, så att förloppet kan visas per ruta med en
 uppskattning av återstående tid (från pc:count och den uppmätta hastigheten).
 
 Klasser: 1 oklassad, 2 mark, 7 lågt brus, 18 högt brus. Brus tas bort före
-rastren men sparas i punktfilerna. DSM = högsta punkt per cell, små luckor
-fylls från grannceller. DTM = markpunkter trianguleras (TIN) och rastreras,
-alltså utan luckor.
+rastren men sparas i punktfilerna. DSM = högsta punkt inom cellstorlek x rot 2
+från cellens mitt (writers.gdal radius, uppmätt: en punkt sätter sin cell och
+de fyra närmaste), luckor upp till DSM_WINDOW celler fylls med IDW från
+grannceller. DTM = markpunkter trianguleras (TIN) och TIN:ens höjd i
+cellmitten används, alltså utan luckor.
 
 Verktygstips (parameterförklaringar) skrivs till
 LaserdataSkog.HojdmodellerFranLaserdata.pyt.xml från TOOLTIPS nedan när
@@ -53,6 +55,7 @@ import datetime
 import json
 import math
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -148,20 +151,29 @@ TOOLTIPS = {
         "meddelandena."
     ),
     "make_dsm": (
-        "Skapa ytmodellen: högsta laserpunkt per cell, alltså trädtoppar, tak och mark där "
-        "inget skymmer."
+        "Skapa ytmodellen: trädtoppar, tak och mark där inget skymmer. Använder alla "
+        "punkter utom brus (klass 7 och 18), alla returer. Varje cell får den högsta "
+        "punkten inom cellstorleken x 1,41 från cellens mitt, så en hög punkt lyfter även de "
+        "fyra närmaste cellerna. Tomma celler fylls från grannceller upp till 3 celler bort; "
+        "större luckor, oftast öppet vatten, blir NoData."
     ),
     "make_dtm": (
-        "Skapa markmodellen: markytan utan vegetation och byggnader, triangulerad från "
-        "markpunkterna."
+        "Skapa markmodellen: markytan utan vegetation och byggnader. Använder bara punkter "
+        "klassade som mark (klass 2). De trianguleras till ett TIN, och varje cell får TIN:ens "
+        "höjd i cellens mitt. Modellen har inga luckor: där markpunkter saknas, under tät "
+        "vegetation, byggnader eller vatten, är höjden interpolerad rakt över."
     ),
     "make_diff": (
-        "Skapa höjdskillnaden DSM - DTM, i praktiken vegetationens och byggnadernas höjd "
-        "över mark. DSM och DTM beräknas då alltid, men sparas bara om de också är valda."
+        "Skapa höjdskillnaden DSM - DTM per cell, i praktiken vegetationens och byggnadernas "
+        "höjd över mark. Negativa värden (högsta punkten under markytan, mätbrus) sätts till "
+        "0, och cellen är NoData där DSM saknar värde. DSM och DTM beräknas då alltid, men "
+        "sparas bara om de också är valda."
     ),
     "save_points": (
-        "Spara de lästa punkterna som filer. Kan väljas ensamt, utan några raster; då hålls "
-        "bara en ruta i taget i minnet."
+        "Spara de lästa punkterna som filer, oförändrade: alla klasser inklusive brus och "
+        "alla attribut. Filerna täcker områdets bounding box plus 20 m marginal, inte bara "
+        "polygonerna. Kan väljas ensamt, utan några raster; då hålls bara en ruta i taget i "
+        "minnet."
     ),
     "out_workspace": (
         "Geodatabas eller mapp där de valda rastren sparas. I en mapp blir de GeoTIFF. "
@@ -192,7 +204,7 @@ TOOLTIPS = {
         "öppnas i ArcGIS Pro med en Basic-licens. LAS kan läggas till direkt i en karta "
         "men tar mer plats, ungefär 30 byte per punkt."
     ),
-    "out_dsm": "Ytmodellen: högsta punkt per cell, klippt till intresseområdet.",
+    "out_dsm": "Ytmodellen: högsta punkt nära varje cellmitt, klippt till intresseområdet.",
     "out_dtm": "Markmodellen: triangulerad från markpunkterna, klippt till intresseområdet.",
     "out_hojdskillnad": (
         "DSM minus DTM, i praktiken vegetationens och byggnadernas höjd. Negativa värden "
@@ -593,19 +605,23 @@ def _add_to_map(paths, messages):
 _PRODUCTS = {
     SUFFIX_DSM: (
         "Ytmodell (DSM)",
-        "Högsta laserpunkt per cell, alla klasser utom brus (7, 18). Celler utan punkter "
-        "fylls med IDW från grannceller inom {} celler; större luckor, typiskt öppet vatten, "
-        "är NoData.".format(DSM_WINDOW),
+        "Alla punkter utom brus (klass 7 och 18), alla returer. Varje cell har den högsta "
+        "punkten inom {radius:.2f} m (cellstorleken x rot 2) från cellens mitt, så en hög "
+        "punkt lyfter även de fyra närmaste cellerna. Celler utan punkt inom det avståndet "
+        "är fyllda med inverst avståndsviktade värden från celler upp till {window} celler "
+        "bort; större luckor, oftast öppet vatten, är NoData.",
     ),
     SUFFIX_DTM: (
         "Markmodell (DTM)",
-        "Markpunkter (klass 2) triangulerade till ett TIN och rastrerade. Modellen saknar "
-        "luckor; där markpunkter saknas, t.ex. över vatten, är värdet interpolerat.",
+        "Bara markpunkter (klass 2), triangulerade till ett TIN (Delaunay). Varje cell har "
+        "TIN:ens höjd i cellens mitt. Modellen saknar luckor; där markpunkter saknas, under "
+        "tät vegetation, byggnader eller vatten, är höjden linjärt interpolerad.",
     ),
     SUFFIX_DIFF: (
         "Höjdskillnad (DSM - DTM)",
-        "Ytmodellen minus markmodellen, i praktiken vegetationens och byggnadernas höjd över "
-        "mark. Negativa värden (mätbrus) är satta till 0. NoData där DSM saknar värde.",
+        "Ytmodellen minus markmodellen per cell, i praktiken vegetationens och byggnadernas "
+        "höjd över mark. Negativa värden (högsta punkten under markytan, mätbrus) är satta "
+        "till 0. NoData där DSM saknar värde.",
     ),
 }
 
@@ -616,6 +632,9 @@ TERMS_URL = ("https://www.lantmateriet.se/globalassets/geodata/geodataprodukter/
 def _write_raster_metadata(path, suffix, tiles, run):
     """Titel, beskrivning, källrutor med insamlingsdatum, villkor och taggar."""
     title, method = _PRODUCTS[suffix]
+    # Decimalkomma i den svenska texten.
+    method = method.format(radius=run["cell"] * math.sqrt(2), window=DSM_WINDOW)
+    method = re.sub(r"(\d)\.(\d)", r"\1,\2", method)
     h = escape
     rows = "".join(
         "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
