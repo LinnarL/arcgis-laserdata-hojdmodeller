@@ -32,8 +32,15 @@ intresseområdets utbredning. PDAL:s curl i Pro saknar CA-certifikat, så
 ARBITER_CA_INFO pekas mot certifi innan pdal importeras - utan det fastnar
 varje HTTPS-anrop i ett oändligt omförsök.
 
-Rutorna läses en i taget, så att förloppet kan visas per ruta med en
-uppskattning av återstående tid (från pc:count och den uppmätta hastigheten).
+Området delas i block som var för sig ryms i minnesbudgeten (storleken räknas
+från rutornas pc:count). Blocken bearbetas i egna processer
+(laserdata_worker.py), flera åt gången, och sätts sedan ihop med
+MosaicToNewRaster. Varje block läses med marginal så att grannblock möts utan
+skarv. Förloppet visas per block med en uppskattning av återstående tid.
+
+Varför processer och inte trådar: flera PDAL-pipelines i trådar i samma
+process som arcpy kraschade processen (access violation i arcpy efter
+blockfasen). Se laserdata_worker.py.
 
 Klasser: 1 oklassad, 2 mark, 7 lågt brus, 18 högt brus. Brus tas bort före
 rastren men sparas i punktfilerna. DSM = högsta punkt inom cellstorlek x rot 2
@@ -56,14 +63,35 @@ import json
 import math
 import os
 import re
+import shutil
+import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
 from xml.sax.saxutils import escape
 
+import importlib
+import importlib.util
+import queue
+import subprocess
+import sys
+
 import arcpy
 import numpy as np
+
+# PDAL-delen ligger i laserdata_worker.py bredvid verktygslådan och körs i egna
+# processer. Konstanterna delas därifrån, så att de bara finns på ett ställe.
+# reload: Pro håller modulen i minnet mellan körningar och uppdateringar.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import laserdata_worker as _lw  # noqa: E402
+importlib.reload(_lw)
+from laserdata_worker import (  # noqa: E402
+    CLASS_GROUND, DSM_PAD_CELLS, DSM_WINDOW, NODATA, NOISE_CLASSES, SUFFIX_DIFF, SUFFIX_DSM,
+    SUFFIX_DTM)
 
 # ── Konstanter ────────────────────────────────────────────────────────────────
 
@@ -81,30 +109,27 @@ TOKEN_MAX_AGE_S = 50 * 60
 
 SWEREF99TM_WKID = 3006
 RH2000_WKID = 5613
-PC_SRS = "EPSG:5845"  # SWEREF 99 TM + RH 2000, samma som källfilerna
 
-NODATA = -9999.0
-
-CLASS_GROUND = 2
-NOISE_CLASSES = (7, 18)
-
-# Punkter läses med denna marginal runt området, så att TIN:en och DSM:ens
-# lucköppning inte får sämre underlag vid kanten.
+# Varje block läses med denna marginal, så att TIN:en och DSM:ens radie och
+# lucköppning har fullt underlag vid blockkanten och block möts utan skarv.
 READ_MARGIN_M = 20.0
 
-# Luckor i DSM mindre än så här många celler fylls med IDW från grannar.
-DSM_WINDOW = 3
+# Minnestopp per läst punkt i ett block: PDAL:s egen kopia och numpy-arrayen
+# (51 byte var), den reducerade kopian för rastren (X, Y, Z, klass) och
+# trianguleringen av markpunkterna. Uppmätt ~140 byte vid läsning; marginal för TIN.
+PEAK_BYTES_PER_POINT = 170
 
-# Uppmätt: 51 byte per punkt i numpy-arrayen. Under läsningen av en ruta håller
-# PDAL en egen kopia av just den rutans punkter.
-BYTES_PER_POINT = 51
+# Blocksidan hålls mellan dessa gränser (m). Varje block kostar ungefär 1 s
+# extra för att öppna fjärrfilen, så små block blir märkbart långsammare.
+MIN_BLOCK_M = 250
+MAX_BLOCK_M = 5000
 
 DEFAULT_CELL_SIZE = 1.0
-DEFAULT_MAX_AREA_KM2 = 10.0
+DEFAULT_MEMORY_GB = 4.0
+DEFAULT_WORKERS = 4
 
-SUFFIX_DSM = "dsm"
-SUFFIX_DTM = "dtm"
-SUFFIX_DIFF = "hojdskillnad"
+# Varna över denna yta: utdata blir stora och körningen lång.
+LARGE_AREA_KM2 = 200
 
 AOI_POLYGONS = "Polygoner i ett lager"
 AOI_EXTENT = "Utbredning (kartvy, lager eller koordinater)"
@@ -170,10 +195,9 @@ TOOLTIPS = {
         "sparas bara om de också är valda."
     ),
     "save_points": (
-        "Spara de lästa punkterna som filer, oförändrade: alla klasser inklusive brus och "
-        "alla attribut. Filerna täcker områdets bounding box plus 20 m marginal, inte bara "
-        "polygonerna. Kan väljas ensamt, utan några raster; då hålls bara en ruta i taget i "
-        "minnet."
+        "Spara punkterna som filer, oförändrade: alla klasser inklusive brus och alla "
+        "attribut. Filerna täcker områdets bounding box, inte bara polygonerna. Kan väljas "
+        "ensamt, utan några raster."
     ),
     "out_workspace": (
         "Geodatabas eller mapp där de valda rastren sparas. I en mapp blir de GeoTIFF. "
@@ -189,15 +213,24 @@ TOOLTIPS = {
         "en markpunkt per m² i öppen skog, så 1 m är ett bra standardval. Mindre celler "
         "ger en glest fylld DSM."
     ),
-    "max_area_km2": (
-        "Skydd mot att råka välja ett för stort område. Alla punkter hålls i minnet medan "
-        "rastren skapas, ungefär 100-150 MB per km² av områdets utbredning. Höj gränsen om "
-        "datorn har minne nog."
+    "memory_gb": (
+        "Ungefär hur mycket arbetsminne verktyget får använda utöver ArcGIS Pro självt. "
+        "Området delas i block som var för sig ryms i minnet, så ytan begränsas inte av "
+        "minnet. Mindre budget ger fler och mindre block, vilket blir något långsammare "
+        "(ungefär 1 s extra per block). Uppmätt: 25 km² med 4 GB tog 75 s och som mest "
+        "3,3 GB."
+    ),
+    "workers": (
+        "Antal block som bearbetas samtidigt, vart och ett i en egen process. Läsningen "
+        "väntar mest på nätverket, så 4 block samtidigt gick ungefär dubbelt så fort som ett "
+        "i taget. Minnesbudgeten delas mellan dem. 1 till 8."
     ),
     "raw_folder": (
-        "Mapp där punkterna sparas, en fil per ruta med namnet <prefix>_<ruta>.laz eller "
-        ".las. Filerna innehåller alla punkter inom områdets utbredning (inte hela rutor) "
-        "med alla klasser, även brus. Undvik mappar som synkas till molnet, som OneDrive."
+        "Mapp där punkterna sparas, en fil per block och ruta med namnet "
+        "<prefix>_<ruta>_<rad>_<kolumn>.laz eller .las. Punkterna är oförändrade: alla "
+        "klasser och attribut, samma punktformat, skala och offset som Lantmäteriets filer. "
+        "Varje punkt finns i exakt en fil. Filerna täcker områdets bounding box, inte hela "
+        "rutor. Undvik mappar som synkas till molnet, som OneDrive."
     ),
     "raw_format": (
         "Filformat för sparade punkter. LAZ är ungefär 5-7 gånger mindre men kan inte "
@@ -492,81 +525,186 @@ def _capture_period(tile):
     return start if last in ("", start) else "{} - {}".format(start, last)
 
 
-def _read_bounds(tile, extent):
-    """Områdets utbredning (med marginal) snittad med rutan, och andelen av rutan."""
-    xmin, ymin, xmax, ymax = tile["bbox"]
-    bx0 = max(xmin, extent.XMin - READ_MARGIN_M)
-    bx1 = min(xmax, extent.XMax + READ_MARGIN_M)
-    by0 = max(ymin, extent.YMin - READ_MARGIN_M)
-    by1 = min(ymax, extent.YMax + READ_MARGIN_M)
-    frac = max(0.0, (bx1 - bx0) * (by1 - by0)) / ((xmax - xmin) * (ymax - ymin))
-    return "([{:.2f},{:.2f}],[{:.2f},{:.2f}])".format(bx0, bx1, by0, by1), frac
+def _rect_polygon(x0, y0, x1, y1):
+    sr = arcpy.SpatialReference(SWEREF99TM_WKID)
+    return arcpy.Polygon(arcpy.Array([arcpy.Point(x0, y0), arcpy.Point(x0, y1),
+                                      arcpy.Point(x1, y1), arcpy.Point(x1, y0)]), sr)
+
+
+def _plan_blocks(aoi, grid, tiles, memory_gb, workers, skip_outside=True):
+    """
+    Dela områdets rutnät i block som vart och ett ryms i minnesbudgeten delat
+    med antalet samtidiga block. Blockstorleken räknas från den tätaste rutans
+    punkttäthet (pc:count / rutans yta). Block som inte skär polygonen hoppas över
+    när skip_outside är sant; för punktfiler behövs alla, så att filerna täcker
+    hela områdets bounding box.
+
+    Returnerar (block, blocksida i m). Varje block har sina hörn, sitt delrutnät
+    och de rutor det behöver läsa, med läsgränser inklusive marginal.
+    """
+    cell = grid["resolution"]
+    # Marginalen ska också täcka DSM:ens extra kantceller plus sökradien.
+    margin = max(READ_MARGIN_M, (DSM_PAD_CELLS + 2) * cell)
+    density = max(t["count"] / ((t["bbox"][2] - t["bbox"][0]) * (t["bbox"][3] - t["bbox"][1]))
+                  for t in tiles) or 1.0
+    points_per_block = memory_gb * 1e9 / max(1, workers) / PEAK_BYTES_PER_POINT
+    side = math.sqrt(points_per_block / density) - 2 * margin
+    side = min(MAX_BLOCK_M, max(MIN_BLOCK_M, side))
+    side_cells = max(1, int(side // cell))
+
+    blocks = []
+    n_cols = int(math.ceil(grid["width"] / side_cells))
+    n_rows = int(math.ceil(grid["height"] / side_cells))
+    for ry in range(n_rows):
+        for cx in range(n_cols):
+            c0, r0 = cx * side_cells, ry * side_cells
+            w = min(side_cells, grid["width"] - c0)
+            h = min(side_cells, grid["height"] - r0)
+            x0 = grid["origin_x"] + c0 * cell
+            y0 = grid["origin_y"] + r0 * cell
+            x1, y1 = x0 + w * cell, y0 + h * cell
+            if skip_outside and aoi.disjoint(_rect_polygon(x0, y0, x1, y1)):
+                continue
+            mx0, my0 = x0 - margin, y0 - margin
+            mx1, my1 = x1 + margin, y1 + margin
+            reads = []
+            expected = 0.0
+            for t in tiles:
+                tx0, ty0, tx1, ty1 = t["bbox"]
+                bx0, bx1 = max(tx0, mx0), min(tx1, mx1)
+                by0, by1 = max(ty0, my0), min(ty1, my1)
+                if bx1 <= bx0 or by1 <= by0:
+                    continue
+                bounds = "([{:.2f},{:.2f}],[{:.2f},{:.2f}])".format(bx0, bx1, by0, by1)
+                reads.append((t, bounds))
+                expected += t["count"] * (bx1 - bx0) * (by1 - by0) / ((tx1 - tx0) * (ty1 - ty0))
+            if not reads:
+                continue
+            blocks.append({
+                # Rad räknas från norr, som man läser en karta.
+                "row": n_rows - ry, "col": cx + 1,
+                "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                "grid": {"resolution": cell, "origin_x": x0, "origin_y": y0,
+                         "width": w, "height": h},
+                "reads": reads, "expected": expected,
+            })
+    return blocks, side_cells * cell
+
+
+class _Token:
+    """Token som delas mellan trådarna och förnyas innan den går ut."""
+
+    def __init__(self, key, secret):
+        self._key, self._secret = key, secret
+        self._lock = threading.Lock()
+        self._token = _get_token(key, secret)
+        self._time = time.time()
+
+    def get(self):
+        with self._lock:
+            if time.time() - self._time > TOKEN_MAX_AGE_S:
+                self._token = _get_token(self._key, self._secret)
+                self._time = time.time()
+            return self._token
 
 
 # =============================================================================
-# PDAL
+# Arbetsprocesser
 # =============================================================================
 
-def _import_pdal():
-    # Pro:s PDAL-bygge har curl utan CA-certifikat. Utan detta misslyckas varje
-    # HTTPS-anslutning och arbiter försöker om i all oändlighet.
-    try:
-        import certifi
-        os.environ.setdefault("ARBITER_CA_INFO", certifi.where())
-    except ImportError:
-        pass
-    try:
-        import pdal
-    except ImportError:
-        import sys
-        raise ValueError(
-            "Python-paketet pdal saknas i den aktiva miljön ({}). Det ingår i "
-            "standardmiljön arcgispro-py3.".format(sys.prefix)
-        )
-    return pdal
+def _python_exe():
+    """python.exe i den aktiva miljön. I Pro är sys.executable ArcGISPro.exe."""
+    for cand in (os.path.join(sys.exec_prefix, "python.exe"), sys.executable):
+        if cand and os.path.basename(cand).lower() == "python.exe" and os.path.isfile(cand):
+            return cand
+    raise ValueError("Hittar inte python.exe i den aktiva miljön ({}).".format(sys.exec_prefix))
 
 
-def _read_tile(pdal, tile, token, bounds):
-    """Alla punkter i rutan inom bounds, alla klasser."""
-    stage = {
-        "type": "readers.copc",
-        "filename": {"path": tile["href"], "headers": {"Authorization": "Bearer " + token}},
-        "bounds": bounds,
+class _WorkerPool:
+    """
+    Ett fast antal laserdata_worker-processer som tar ett block i taget.
+
+    Varför processer och inte trådar: flera PDAL-pipelines i trådar i samma
+    process som arcpy kraschade processen (access violation i arcpy efter
+    blockfasen, reproducerbart med 4 trådar, aldrig med 1). Processerna startas
+    en gång (cirka 1,7 s för Python, numpy och PDAL) och återanvänds.
+
+    En läsartråd per process väntar på svar och lägger dem i en kö; trådarna
+    gör bara I/O mot rören, aldrig PDAL eller arcpy.
+    """
+
+    def __init__(self, n, workdir):
+        self._results = queue.Queue()
+        self._procs = []
+        self._logs = []
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        exe = _python_exe()
+        script = os.path.join(_HERE, "laserdata_worker.py")
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        for i in range(n):
+            log_path = os.path.join(workdir, "worker_{}.log".format(i))
+            log = open(log_path, "w", encoding="utf-8", errors="replace")
+            proc = subprocess.Popen(
+                [exe, "-u", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=log, encoding="utf-8", errors="replace", creationflags=flags,
+                env=env, cwd=workdir)
+            self._procs.append(proc)
+            self._logs.append((log, log_path))
+            threading.Thread(target=self._reader, args=(i, proc), daemon=True).start()
+
+    def _reader(self, i, proc):
+        for line in proc.stdout:
+            if line.startswith(_lw.RESULT_PREFIX):
+                self._results.put((i, json.loads(line[len(_lw.RESULT_PREFIX):])))
+        self._results.put((i, None))  # processen har avslutats
+
+    def submit(self, i, task):
+        self._procs[i].stdin.write(json.dumps(task) + "\n")
+        self._procs[i].stdin.flush()
+
+    def get(self, timeout):
+        """(processindex, svar) eller None vid timeout. Svar None = processen dog."""
+        try:
+            return self._results.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def log_tail(self, i, n=15):
+        log, path = self._logs[i]
+        log.flush()
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return "".join(fh.readlines()[-n:])
+        except OSError:
+            return ""
+
+    def close(self, kill=False):
+        for proc in self._procs:
+            try:
+                if kill:
+                    proc.kill()
+                else:
+                    proc.stdin.close()
+            except OSError:
+                pass
+        for proc in self._procs:
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        for log, _path in self._logs:
+            log.close()
+
+
+def _block_task(blk, token, need_dsm, need_dtm, raw_folder, raw_ext, prefix, workdir):
+    """Blocket som JSON-uppgift till en arbetsprocess (bara det den behöver)."""
+    return {
+        "block": {k: blk[k] for k in ("row", "col", "x0", "y0", "x1", "y1", "grid")}
+        | {"reads": [{"href": t["href"], "id": t["id"], "bounds": bounds}
+                     for t, bounds in blk["reads"]]},
+        "token": token, "need_dsm": need_dsm, "need_dtm": need_dtm,
+        "raw_folder": raw_folder, "raw_ext": raw_ext, "prefix": prefix, "workdir": workdir,
     }
-    pipe = pdal.Pipeline(json.dumps([stage]))
-    pipe.execute()
-    arrays = pipe.arrays
-    return arrays[0] if len(arrays) == 1 else np.concatenate(arrays)
-
-
-def _write_points(pdal, points, path):
-    # Tillägget avgör formatet: .laz komprimeras, .las blir okomprimerad.
-    # Från en numpy-array har PDAL inget koordinatsystem, så det sätts här.
-    stage = {"type": "writers.las", "filename": path, "minor_version": 4,
-             "extra_dims": "all", "a_srs": PC_SRS}
-    pdal.Pipeline(json.dumps([stage]), arrays=[points]).execute()
-
-
-def _write_dsm(pdal, arrays, grid, path):
-    # writers.gdal lägger flera arrayer i samma rutnät, så rutorna behöver inte
-    # slås ihop först (det skulle dubbla minnesåtgången en stund).
-    stage = {"type": "writers.gdal", "filename": path, "output_type": "max",
-             "window_size": DSM_WINDOW, "data_type": "float32", "nodata": NODATA}
-    stage.update(grid)
-    pdal.Pipeline(json.dumps([stage]), arrays=arrays).execute()
-
-
-def _write_dtm(pdal, ground, grid, path):
-    # En enda array: filters.delaunay trianguerar varje array för sig, och
-    # separata rutor skulle ge en lucka längs rutgränsen.
-    face = {"type": "filters.faceraster"}
-    face.update(grid)
-    stages = [
-        {"type": "filters.delaunay"},
-        face,
-        {"type": "writers.raster", "filename": path, "data_type": "float32", "nodata": NODATA},
-    ]
-    pdal.Pipeline(json.dumps(stages), arrays=[ground]).execute()
 
 
 # =============================================================================
@@ -831,11 +969,19 @@ class HojdmodellerFranLaserdata:
         )
         p_cell.value = DEFAULT_CELL_SIZE
 
-        p_max = arcpy.Parameter(
-            displayName="Största tillåtna yta (km²)", name="max_area_km2", datatype="GPDouble",
+        p_mem = arcpy.Parameter(
+            displayName="Minnesbudget (GB)", name="memory_gb", datatype="GPDouble",
             parameterType="Optional", direction="Input", category="Avancerat",
         )
-        p_max.value = DEFAULT_MAX_AREA_KM2
+        p_mem.value = DEFAULT_MEMORY_GB
+
+        p_workers = arcpy.Parameter(
+            displayName="Block samtidigt", name="workers", datatype="GPLong",
+            parameterType="Optional", direction="Input", category="Avancerat",
+        )
+        p_workers.filter.type = "Range"
+        p_workers.filter.list = [1, 8]
+        p_workers.value = DEFAULT_WORKERS
 
         p_out = [
             arcpy.Parameter(displayName=label, name="out_" + suffix, datatype="DERasterDataset",
@@ -844,8 +990,8 @@ class HojdmodellerFranLaserdata:
                                   ("Höjdskillnad", SUFFIX_DIFF))
         ]
 
-        return [p_mode, p_aoi, p_extent, p_key, p_secret, p_make_dsm, p_make_dtm, p_make_diff, p_save_pts,
-                p_raw, p_raw_fmt, p_ws, p_prefix, p_cell, p_max] + p_out
+        return [p_mode, p_aoi, p_extent, p_key, p_secret, p_make_dsm, p_make_dtm, p_make_diff,
+                p_save_pts, p_raw, p_raw_fmt, p_ws, p_prefix, p_cell, p_mem, p_workers] + p_out
 
     def isLicensed(self):
         return True
@@ -903,8 +1049,9 @@ class HojdmodellerFranLaserdata:
                 "DTM:en bara interpolerad mellan markpunkterna."
             )
 
-        if p["max_area_km2"].value is not None and p["max_area_km2"].value <= 0:
-            p["max_area_km2"].setErrorMessage("Ange en yta större än 0.")
+        mem = p["memory_gb"].value
+        if mem is not None and mem < 0.5:
+            p["memory_gb"].setErrorMessage("Ange minst 0,5 GB.")
 
         raw = (p["raw_folder"].valueAsText or "").lower()
         if save and raw and any(h in raw for h in _SYNC_HINTS):
@@ -941,7 +1088,8 @@ class HojdmodellerFranLaserdata:
                 p["out_workspace"].valueAsText,
                 p["prefix"].valueAsText.strip(),
                 p["cell_size"].value or DEFAULT_CELL_SIZE,
-                p["max_area_km2"].value or DEFAULT_MAX_AREA_KM2,
+                p["memory_gb"].value or DEFAULT_MEMORY_GB,
+                p["workers"].value or DEFAULT_WORKERS,
                 messages,
             )
         except ValueError as exc:
@@ -961,11 +1109,15 @@ class HojdmodellerFranLaserdata:
 # =============================================================================
 
 def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cell,
-         max_area_km2, messages):
+         memory_gb, workers, messages):
     """
     aoi: polygon i SWEREF 99 TM (från _aoi_geometry eller _aoi_from_extent).
     products: de raster som ska sparas, en delmängd av SUFFIX_DSM/DTM/DIFF.
     raw_folder: mapp för punktfiler, eller None. Returnerar {suffix: sökväg}.
+
+    Området delas i block (se _plan_blocks) som bearbetas i `workers` trådar.
+    Trådarna gör bara PDAL-arbete; höjdskillnad, mosaik, klippning och metadata
+    görs med arcpy i huvudtråden.
     """
     if not products and not raw_folder:
         raise ValueError("Välj minst en sak att skapa: DSM, DTM, höjdskillnad eller punktfiler.")
@@ -973,6 +1125,7 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
         raise ValueError("Ange en utdata-arbetsyta för rastren.")
     if raw_folder and not os.path.isdir(raw_folder):
         raise ValueError("Mappen för punktfiler finns inte: {}".format(raw_folder))
+    workers = max(1, min(8, int(workers)))
 
     # Höjdskillnaden räknas ur DSM och DTM, så de skapas internt även om de
     # inte ska sparas.
@@ -981,20 +1134,17 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
     need_diff = SUFFIX_DIFF in products
 
     ext = aoi.extent
+    grid = _grid(ext, cell)
     area_km2 = (ext.XMax - ext.XMin) * (ext.YMax - ext.YMin) / 1e6
     messages.addMessage("Intresseområdets utbredning: {:.2f} km² (SWEREF 99 TM).".format(area_km2))
-    if area_km2 > max_area_km2:
-        raise ValueError(
-            "Utbredningen är {:.1f} km², mer än tillåtna {:.1f} km². Alla punkter hålls i "
-            "minnet (ungefär 100-150 MB per km²), så dela upp området eller höj gränsen "
-            "under Avancerat.".format(area_km2, max_area_km2)
-        )
     wanted = [{SUFFIX_DSM: "DSM", SUFFIX_DTM: "DTM", SUFFIX_DIFF: "höjdskillnad"}[s]
               for s in products] + (["punktfiler"] if raw_folder else [])
     messages.addMessage("Skapar: {}.".format(", ".join(wanted)))
 
-    n_steps = 3 + need_dsm + need_dtm + need_diff + (2 if products else 0)
+    n_steps = 3 + (3 if products else 0) + (1 if need_diff else 0)
     steps = _Steps(n_steps, messages)
+    workdir = os.path.join(arcpy.env.scratchFolder, "lds_" + uuid.uuid4().hex[:8])
+    os.makedirs(workdir)
     try:
         steps.next("söker rutor i Lantmäteriets STAC-katalog")
         wgs = aoi.projectAs(arcpy.SpatialReference(4326)).extent
@@ -1005,14 +1155,11 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
                 "Inga laserdata för området. Laserdata Skog täcker ungefär 75 % av Sverige, "
                 "men inte fjällen."
             )
-        for t in tiles:
-            t["bounds"], frac = _read_bounds(t, ext)
-            t["expected"] = t["count"] * frac
-        expected = sum(t["expected"] for t in tiles)
-        mem = "cirka {:.1f} GB minne".format(expected * BYTES_PER_POINT / 1e9) if products \
-            else "en ruta i taget i minnet"
-        steps.done("{} ruta/rutor. Ungefär {} miljoner punkter väntas, {}.".format(
-            len(tiles), _fmt_count(expected / 1e6), mem))
+        blocks, side = _plan_blocks(aoi, grid, tiles, memory_gb, workers,
+                                    skip_outside=not raw_folder)
+        expected = sum(b["expected"] for b in blocks)
+        steps.done("{} ruta/rutor. Ungefär {} miljoner punkter väntas.".format(
+            len(tiles), _fmt_count(expected / 1e6)))
         for t in tiles:
             messages.addMessage("    {}: skanningsområde {}, insamlad {}.".format(
                 t["id"], t["area"] or "okänt", _capture_period(t)))
@@ -1021,121 +1168,152 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
                 "Rutorna är skannade vid olika tillfällen. Rastren kan ha en skarv vid "
                 "rutgränsen, särskilt om årstid eller år skiljer sig."
             )
+        workers = min(workers, len(blocks))
+        messages.addMessage(
+            "    {} block på upp till {:.0f} x {:.0f} m, {} åt gången, inom en minnesbudget "
+            "på {:g} GB.".format(len(blocks), side, side, workers, memory_gb))
+        if products and area_km2 > LARGE_AREA_KM2:
+            out_gb = grid["width"] * grid["height"] * 4 * len(products) / 1e9
+            messages.addWarningMessage(
+                "Stort område: rastren blir ungefär {:.1f} GB, och lika mycket till behövs "
+                "tillfälligt i {}.".format(out_gb, arcpy.env.scratchFolder))
 
         steps.next("hämtar token och kontrollerar behörighet")
-        token = _get_token(key, secret)
-        token_time = time.time()
-        _check_access(tiles[0]["href"], token)
-        pdal = _import_pdal()
+        token = _Token(key, secret)
+        _check_access(tiles[0]["href"], token.get())
+        if importlib.util.find_spec("pdal") is None:
+            raise ValueError(
+                "Python-paketet pdal saknas i den aktiva miljön ({}). Det ingår i "
+                "standardmiljön arcgispro-py3.".format(sys.prefix))
         steps.done()
 
-        steps.next("läser punkter, {} ruta/rutor".format(len(tiles)))
+        # ── Blocken ──────────────────────────────────────────────────────────
+        steps.next("läser och bearbetar {} block, {} åt gången".format(len(blocks), workers))
         arcpy.SetProgressor("step", "", 0, 100, 1)
-        arrays = []
-        n_total = 0
-        n_read = 0
+        parts = {SUFFIX_DSM: [], SUFFIX_DTM: [], SUFFIX_DIFF: []}
+        diff_jobs = []
+        n_points = n_ground = n_raw_files = 0
         done_expected = 0.0
-        t_read = time.time()
-        for i, t in enumerate(tiles, 1):
-            eta = ""
-            if done_expected > 0:
-                rate = (time.time() - t_read) / done_expected
-                eta = ", ca {} kvar".format(_fmt_duration(rate * (expected - done_expected)))
-            steps.label("läser ruta {} av {} ({}){}".format(i, len(tiles), t["id"], eta))
-
-            if time.time() - token_time > TOKEN_MAX_AGE_S:
-                token = _get_token(key, secret)
-                token_time = time.time()
-
-            t0 = time.time()
-            pts = _read_tile(pdal, t, token, t["bounds"])
-            n_read += len(pts)
-            msg = "    Ruta {} av {} ({}): {} punkter på {}".format(
-                i, len(tiles), t["id"], _fmt_count(len(pts)), _fmt_duration(time.time() - t0))
-
-            if raw_folder and len(pts):
-                path = os.path.join(raw_folder, "{}_{}{}".format(prefix, t["id"], raw_ext))
-                steps.label("sparar punkter för ruta {} av {}".format(i, len(tiles)))
-                _write_points(pdal, pts, path.replace("\\", "/"))
-                msg += ", sparade {} ({:.0f} MB)".format(
-                    os.path.basename(path), os.path.getsize(path) / 1e6)
-
-            if products:
-                pts = pts[~np.isin(pts["Classification"], NOISE_CLASSES)]
-                if len(pts):
-                    arrays.append(pts)
-                    n_total += len(pts)
-            del pts
-            messages.addMessage(msg + ".")
-
-            done_expected += t["expected"]
-            arcpy.SetProgressorPosition(min(100, int(100 * done_expected / max(expected, 1))))
-        if n_read == 0:
-            raise ValueError("Inga punkter inom området.")
-        if not products:
-            steps.done("{} punkter sparade.".format(_fmt_count(n_read)))
-            messages.addMessage("Klart på {}.".format(_fmt_duration(time.time() - steps.t0)))
-            return {}
-        steps.done("{} punkter efter att brus tagits bort.".format(_fmt_count(n_total)))
-
-        grid = _grid(ext, cell)
-        scratch = arcpy.env.scratchFolder
-        tmp = {SUFFIX_DSM: os.path.join(scratch, "lds_dsm.tif").replace("\\", "/"),
-               SUFFIX_DTM: os.path.join(scratch, "lds_dtm.tif").replace("\\", "/"),
-               SUFFIX_DIFF: os.path.join(scratch, "lds_diff.tif")}
-        cells = grid["width"] * grid["height"]
-
-        ground = None
-        if need_dtm:
-            ground = np.concatenate([a[a["Classification"] == CLASS_GROUND] for a in arrays])
-        if need_dsm:
-            steps.next("skapar DSM av {} punkter i {} celler (inget delförlopp "
-                       "tillgängligt)".format(_fmt_count(n_total), _fmt_count(cells)))
-            _write_dsm(pdal, arrays, grid, tmp[SUFFIX_DSM])
-            steps.done()
-        del arrays
-
-        n_ground = 0
-        if need_dtm:
-            n_ground = len(ground)
-            steps.next("skapar DTM genom att triangulera {} markpunkter (inget delförlopp "
-                       "tillgängligt)".format(_fmt_count(n_ground)))
-            _write_dtm(pdal, ground, grid, tmp[SUFFIX_DTM])
-            steps.done()
-        del ground
-
+        t_blocks = time.time()
         sr = arcpy.SpatialReference(SWEREF99TM_WKID, RH2000_WKID)
         old_ocs = arcpy.env.outputCoordinateSystem
         old_overwrite = arcpy.env.overwriteOutput
+        old_extent = arcpy.env.extent
+        pool = _WorkerPool(workers, workdir)
+        failed = True
+        try:
+            arcpy.env.outputCoordinateSystem = sr
+            arcpy.env.overwriteOutput = True
+            pending = list(blocks)
+            running = {}
+            for i in range(workers):
+                b = pending.pop(0)
+                running[i] = b
+                pool.submit(i, _block_task(b, token.get(), need_dsm, need_dtm, raw_folder,
+                                           raw_ext, prefix, workdir))
+            k = 0
+            while running:
+                got = pool.get(timeout=1.0)
+                if getattr(arcpy.env, "isCancelled", False):
+                    raise ValueError("Avbrutet av användaren.")
+                if got is None:
+                    continue
+                i, reply = got
+                b = running.pop(i)
+                if reply is None:
+                    raise RuntimeError("Arbetsprocessen avslutades oväntat under block rad {}, "
+                                       "kolumn {}:\n{}".format(b["row"], b["col"], pool.log_tail(i)))
+                if not reply["ok"]:
+                    raise RuntimeError("Fel i block rad {}, kolumn {}:\n{}".format(
+                        b["row"], b["col"], reply["error"]))
+                if pending:
+                    nb = pending.pop(0)
+                    running[i] = nb
+                    pool.submit(i, _block_task(nb, token.get(), need_dsm, need_dtm, raw_folder,
+                                               raw_ext, prefix, workdir))
+
+                res = reply["result"]
+                k += 1
+                n_points += res["points"]
+                n_ground += res["ground"]
+                n_raw_files += len(res["raw"])
+                for suffix in (SUFFIX_DSM, SUFFIX_DTM):
+                    if suffix in res:
+                        parts[suffix].append(res[suffix])
+                if need_diff and SUFFIX_DSM in res and SUFFIX_DTM in res:
+                    diff_jobs.append((res, b))
+
+                done_expected += b["expected"]
+                elapsed = time.time() - t_blocks
+                left = elapsed / done_expected * (expected - done_expected) if done_expected else 0
+                msg = "    Block {} av {} (rad {}, kolumn {}): {} punkter".format(
+                    k, len(blocks), b["row"], b["col"], _fmt_count(res["points"]))
+                if res["raw"]:
+                    msg += ", {} punktfil(er)".format(len(res["raw"]))
+                messages.addMessage(msg + ".")
+                steps.label("block {} av {} klara{}".format(
+                    k, len(blocks), ", ca {} kvar".format(_fmt_duration(left)) if running else ""))
+                arcpy.SetProgressorPosition(min(100, int(100 * done_expected / max(expected, 1))))
+            failed = False
+        finally:
+            pool.close(kill=failed)
+            arcpy.env.outputCoordinateSystem = old_ocs
+            arcpy.env.overwriteOutput = old_overwrite
+
+        if n_points == 0:
+            raise ValueError("Inga punkter inom området.")
+        extra = ", {} punktfiler i {}".format(n_raw_files, raw_folder) if raw_folder else ""
+        steps.done("{} punkter inom området{}.".format(_fmt_count(n_points), extra))
+        if not products:
+            messages.addMessage("Klart på {}.".format(_fmt_duration(time.time() - steps.t0)))
+            return {}
+
+        # ── Höjdskillnad, mosaik, klippning, metadata (bara huvudtråden) ─────
+        outputs = {}
         try:
             arcpy.env.outputCoordinateSystem = sr
             arcpy.env.overwriteOutput = True
 
             if need_diff:
-                steps.next("beräknar höjdskillnad")
-                dsm = arcpy.RasterToNumPyArray(tmp[SUFFIX_DSM], nodata_to_value=np.nan)
-                dtm = arcpy.RasterToNumPyArray(tmp[SUFFIX_DTM], nodata_to_value=np.nan)
-                diff = dsm - dtm
-                del dsm, dtm
-                # Små negativa värden är mätbrus (DSM:ens högsta punkt under TIN:en).
-                diff = np.where(diff < 0, 0, diff)
-                diff = np.where(np.isnan(diff), NODATA, diff).astype(np.float32)
-                arcpy.NumPyArrayToRaster(
-                    diff, arcpy.Point(grid["origin_x"], grid["origin_y"]), cell, cell, NODATA
-                ).save(tmp[SUFFIX_DIFF])
-                del diff
+                steps.next("beräknar höjdskillnad, {} block".format(len(diff_jobs)))
+                arcpy.SetProgressor("step", "", 0, max(1, len(diff_jobs)), 1)
+                for k, (res, b) in enumerate(diff_jobs, 1):
+                    steps.label("beräknar höjdskillnad, block {} av {}".format(k, len(diff_jobs)))
+                    parts[SUFFIX_DIFF].append(_block_diff(res, b, workdir))
+                    arcpy.SetProgressorPosition(k)
                 steps.done()
+            arcpy.env.extent = arcpy.Extent(
+                grid["origin_x"], grid["origin_y"],
+                grid["origin_x"] + grid["width"] * cell, grid["origin_y"] + grid["height"] * cell)
+
+            steps.next("sätter ihop blocken till hela raster")
+            mosaics = {}
+            for i, suffix in enumerate(products, 1):
+                if not parts[suffix]:
+                    messages.addWarningMessage("Inga data för {}.".format(suffix))
+                    continue
+                steps.label("sätter ihop {} ({} av {}), {} block".format(
+                    suffix, i, len(products), len(parts[suffix])))
+                name = "m_{}.tif".format(suffix)
+                arcpy.management.MosaicToNewRaster(
+                    ";".join(parts[suffix]), workdir, name, sr, "32_BIT_FLOAT", cell, 1,
+                    "FIRST", "FIRST")
+                mosaics[suffix] = os.path.join(workdir, name)
+            steps.done()
 
             steps.next("klipper rastren till intresseområdet och skriver metadata")
-            clip_fc = arcpy.management.CopyFeatures([aoi], r"memory\lds_aoi")[0]
+            arcpy.env.extent = old_extent
+            # Klippmallen skrivs i körningens egen temp-mapp, inte i memory\:
+            # Delete på en memory\-featureklass kraschade processen (access
+            # violation) efter blockfasen. Mappen tas bort med resten i finally.
+            clip_fc = arcpy.management.CopyFeatures([aoi], os.path.join(workdir, "aoi.shp"))[0]
             rect = "{} {} {} {}".format(ext.XMin, ext.YMin, ext.XMax, ext.YMax)
-            run_info = {"extent": ext, "cell": cell, "points": n_total, "ground": n_ground,
+            run_info = {"extent": ext, "cell": cell, "points": n_points, "ground": n_ground,
                         "created": datetime.date.today().isoformat()}
-            outputs = {}
-            for i, suffix in enumerate(products, 1):
-                steps.label("klipper {} ({} av {})".format(suffix, i, len(products)))
+            for i, suffix in enumerate(mosaics, 1):
+                steps.label("klipper {} ({} av {})".format(suffix, i, len(mosaics)))
                 dst = _out_path(workspace, prefix, suffix)
-                arcpy.management.Clip(tmp[suffix], rect, dst, clip_fc, str(NODATA),
+                arcpy.management.Clip(mosaics[suffix], rect, dst, clip_fc, str(NODATA),
                                       "ClippingGeometry", "NO_MAINTAIN_EXTENT")
                 # Clip tappar PDAL:s sammansatta koordinatsystem, sätt det igen.
                 arcpy.management.DefineProjection(dst, sr)
@@ -1146,18 +1324,11 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
                         "Kunde inte skriva metadata för {}: {}".format(os.path.basename(dst), exc))
                 outputs[suffix] = dst
                 messages.addMessage("    Skapade {}.".format(dst))
-            arcpy.management.Delete(clip_fc)
             steps.done()
         finally:
             arcpy.env.outputCoordinateSystem = old_ocs
             arcpy.env.overwriteOutput = old_overwrite
-
-        for path in tmp.values():
-            try:
-                if arcpy.Exists(path):
-                    arcpy.management.Delete(path)
-            except Exception:
-                pass
+            arcpy.env.extent = old_extent
 
         steps.next("lägger till rastren i kartan")
         _add_to_map(list(outputs.values()), messages)
@@ -1166,3 +1337,26 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
         return outputs
     finally:
         arcpy.ResetProgressor()
+        # arcpy håller mappen öppen som arbetsyta efter MosaicToNewRaster, och då
+        # blir en tom mapp kvar. Släpp just den mappen (utan argument skulle
+        # alla arbetsytor i Pro-sessionen släppas, även användarens egna).
+        try:
+            arcpy.management.ClearWorkspaceCache(workdir)
+        except Exception:
+            pass
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _block_diff(res, blk, workdir):
+    """DSM - DTM för ett block. Huvudtråden (arcpy), ett block i taget i minnet."""
+    dsm = arcpy.RasterToNumPyArray(res[SUFFIX_DSM], nodata_to_value=np.nan)
+    dtm = arcpy.RasterToNumPyArray(res[SUFFIX_DTM], nodata_to_value=np.nan)
+    diff = dsm - dtm
+    del dsm, dtm
+    # Små negativa värden är mätbrus (DSM:ens högsta punkt under TIN:en).
+    diff = np.where(diff < 0, 0, diff)
+    diff = np.where(np.isnan(diff), NODATA, diff).astype(np.float32)
+    path = os.path.join(workdir, "diff_{:03d}_{:03d}.tif".format(blk["row"], blk["col"]))
+    cell = blk["grid"]["resolution"]
+    arcpy.NumPyArrayToRaster(diff, arcpy.Point(blk["x0"], blk["y0"]), cell, cell, NODATA).save(path)
+    return path
