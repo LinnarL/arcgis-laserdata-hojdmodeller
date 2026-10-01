@@ -116,8 +116,11 @@ READ_MARGIN_M = 20.0
 
 # Minnestopp per läst punkt i ett block: PDAL:s egen kopia och numpy-arrayen
 # (51 byte var), den reducerade kopian för rastren (X, Y, Z, klass) och
-# trianguleringen av markpunkterna. Uppmätt ~140 byte vid läsning; marginal för TIN.
+# trianguleringen av markpunkterna. Uppmätt 133-143 byte för hela blocket med
+# DSM och DTM (0,9-5,1 miljoner punkter); marginal för fler attribut och TIN.
 PEAK_BYTES_PER_POINT = 170
+# Fast minne per arbetsprocess (Python, numpy, PDAL), uppmätt ~116 MB.
+WORKER_BASE_BYTES = 150e6
 
 # Blocksidan hålls mellan dessa gränser (m). Varje block kostar ungefär 1 s
 # extra för att öppna fjärrfilen, så små block blir märkbart långsammare.
@@ -125,8 +128,15 @@ MIN_BLOCK_M = 250
 MAX_BLOCK_M = 5000
 
 DEFAULT_CELL_SIZE = 1.0
-DEFAULT_MEMORY_GB = 4.0
-DEFAULT_WORKERS = 4
+# Automatiskt läge (tomma fält): hälften av det lediga arbetsminnet, men minst
+# 2 GB kvar åt Pro och Windows, och en process per processortråd utom en.
+# Taket på antal processer skyddar Lantmäteriets server och nätverket; varje
+# block öppnar dessutom fjärrfilen (~1 s), så små block lönar sig inte.
+AUTO_MEMORY_SHARE = 0.5
+AUTO_MEMORY_RESERVE_GB = 2.0
+MIN_MEMORY_GB = 0.5
+MIN_GB_PER_WORKER = 0.75
+MAX_WORKERS = 16
 
 # Varna över denna yta: utdata blir stora och körningen lång.
 LARGE_AREA_KM2 = 200
@@ -215,15 +225,22 @@ TOOLTIPS = {
     ),
     "memory_gb": (
         "Ungefär hur mycket arbetsminne verktyget får använda utöver ArcGIS Pro självt. "
-        "Området delas i block som var för sig ryms i minnet, så ytan begränsas inte av "
-        "minnet. Mindre budget ger fler och mindre block, vilket blir något långsammare "
-        "(ungefär 1 s extra per block). Uppmätt: 25 km² med 4 GB tog 75 s och som mest "
-        "3,3 GB."
+        "Tomt = automatiskt: hälften av det lediga arbetsminnet när körningen startar, men "
+        "minst 2 GB lämnas kvar åt Pro och Windows. Vilket värde som användes står i "
+        "meddelandena. Området delas i block som var för sig ryms i minnet, så ytan "
+        "begränsas inte av minnet. Mindre budget ger fler och mindre block, vilket blir något "
+        "långsammare (ungefär 1 s extra per block). Varje process behöver ungefär 170 byte "
+        "per läst punkt plus 150 MB. Uppmätt: 25 km² med 4 GB tog 75 s och som mest 3,3 GB. "
+        "Minst 0,5 GB."
     ),
     "workers": (
-        "Antal block som bearbetas samtidigt, vart och ett i en egen process. Läsningen "
-        "väntar mest på nätverket, så 4 block samtidigt gick ungefär dubbelt så fort som ett "
-        "i taget. Minnesbudgeten delas mellan dem. 1 till 8."
+        "Antal block som bearbetas samtidigt, vart och ett i en egen process. Tomt = "
+        "automatiskt: en process per processortråd utom en, högst 16, och högst en per "
+        "0,75 GB i minnesbudgeten. Aldrig fler än det finns block, och blocken görs så små "
+        "att de blir minst lika många som processerna. Läsningen väntar mest på nätverket, så "
+        "4 block samtidigt gick ungefär dubbelt så fort som ett i taget; över 4 är vinsten "
+        "inte uppmätt mot Lantmäteriets server. Med punktfiler blir det en fil per block och "
+        "ruta, så fler processer ger fler och mindre filer. 1 till 32."
     ),
     "raw_folder": (
         "Mapp där punkterna sparas, en fil per block och ruta med namnet "
@@ -261,6 +278,11 @@ def _fmt_duration(seconds):
 
 def _fmt_count(n):
     return "{:,}".format(int(n)).replace(",", " ")
+
+
+def _fmt_gb(v):
+    """GB med en decimal och decimalkomma: 16,9."""
+    return "{:g}".format(round(float(v), 1)).replace(".", ",")
 
 
 class _Steps:
@@ -531,12 +553,64 @@ def _rect_polygon(x0, y0, x1, y1):
                                       arcpy.Point(x1, y1), arcpy.Point(x1, y0)]), sr)
 
 
+def _available_memory_gb():
+    """Ledigt arbetsminne i GB, eller None. psutil ingår i arcgispro-py3."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1e9
+    except Exception:
+        return None
+
+
+def _cpu_threads():
+    """Processortrådar som processen får använda (logiska kärnor)."""
+    n = getattr(os, "process_cpu_count", os.cpu_count)()
+    return max(1, n or 1)
+
+
+def _resolve_resources(memory_gb, workers):
+    """
+    Minnesbudget och antal processer, där None betyder automatiskt. Läses på
+    datorn som kör verktyget när körningen startar. Returnerar (minne i GB,
+    processer, text om vad som valdes eller justerades, eller "").
+    """
+    notes = []
+    if memory_gb is None:
+        avail = _available_memory_gb()
+        if avail is None:
+            memory_gb = 4.0
+            notes.append("minnesbudget 4 GB (ledigt minne kunde inte läsas)")
+        else:
+            memory_gb = max(MIN_MEMORY_GB, min(AUTO_MEMORY_SHARE * avail,
+                                               avail - AUTO_MEMORY_RESERVE_GB))
+            notes.append("minnesbudget {} GB av {} GB ledigt".format(
+                _fmt_gb(memory_gb), _fmt_gb(avail)))
+    memory_gb = max(MIN_MEMORY_GB, float(memory_gb))
+    if workers is None:
+        threads = _cpu_threads()
+        workers = max(1, min(threads - 1, MAX_WORKERS, int(memory_gb / MIN_GB_PER_WORKER)))
+        notes.append("{} processer ({} processortrådar)".format(workers, threads))
+    workers = max(1, min(32, int(workers)))
+    note = "Automatiskt: {}.".format(", ".join(notes)) if notes else ""
+    # Även ett angivet antal måste rymmas: varje process behöver sitt fasta minne
+    # och ett block av rimlig storlek.
+    fit = max(1, int(memory_gb / MIN_GB_PER_WORKER))
+    if workers > fit:
+        note = (note + " " if note else "") + (
+            "{} processer ryms inte i {} GB; använder {} (minst {} GB per process).".format(
+                workers, _fmt_gb(memory_gb), fit,
+                "{:g}".format(MIN_GB_PER_WORKER).replace(".", ",")))
+        workers = fit
+    return memory_gb, workers, note
+
+
 def _plan_blocks(aoi, grid, tiles, memory_gb, workers, skip_outside=True):
     """
     Dela områdets rutnät i block som vart och ett ryms i minnesbudgeten delat
     med antalet samtidiga block. Blockstorleken räknas från den tätaste rutans
-    punkttäthet (pc:count / rutans yta). Block som inte skär polygonen hoppas över
-    när skip_outside är sant; för punktfiler behövs alla, så att filerna täcker
+    punkttäthet (pc:count / rutans yta). Blocken görs också så små att de blir
+    minst lika många som processerna (men inte under MIN_BLOCK_M). Block som inte
+    skär polygonen hoppas över när skip_outside är sant; för punktfiler behövs alla, så att filerna täcker
     hela områdets bounding box.
 
     Returnerar (block, blocksida i m). Varje block har sina hörn, sitt delrutnät
@@ -547,8 +621,14 @@ def _plan_blocks(aoi, grid, tiles, memory_gb, workers, skip_outside=True):
     margin = max(READ_MARGIN_M, (DSM_PAD_CELLS + 2) * cell)
     density = max(t["count"] / ((t["bbox"][2] - t["bbox"][0]) * (t["bbox"][3] - t["bbox"][1]))
                   for t in tiles) or 1.0
-    points_per_block = memory_gb * 1e9 / max(1, workers) / PEAK_BYTES_PER_POINT
+    per_worker = memory_gb * 1e9 / max(1, workers) - WORKER_BASE_BYTES
+    points_per_block = max(1e5, per_worker / PEAK_BYTES_PER_POINT)
     side = math.sqrt(points_per_block / density) - 2 * margin
+    # Minst lika många block som processer, annars står processer oanvända:
+    # läsningen väntar mest på nätverket, så parallellitet väger tyngre än den
+    # extra sekunden det kostar att öppna fjärrfilen för varje block.
+    area = grid["width"] * grid["height"] * cell * cell
+    side = min(side, math.sqrt(area / max(1, workers)))
     side = min(MAX_BLOCK_M, max(MIN_BLOCK_M, side))
     side_cells = max(1, int(side // cell))
 
@@ -973,15 +1053,14 @@ class HojdmodellerFranLaserdata:
             displayName="Minnesbudget (GB)", name="memory_gb", datatype="GPDouble",
             parameterType="Optional", direction="Input", category="Avancerat",
         )
-        p_mem.value = DEFAULT_MEMORY_GB
+        # Tomt = automatiskt, se _resolve_resources.
 
         p_workers = arcpy.Parameter(
             displayName="Block samtidigt", name="workers", datatype="GPLong",
             parameterType="Optional", direction="Input", category="Avancerat",
         )
         p_workers.filter.type = "Range"
-        p_workers.filter.list = [1, 8]
-        p_workers.value = DEFAULT_WORKERS
+        p_workers.filter.list = [1, 32]
 
         p_out = [
             arcpy.Parameter(displayName=label, name="out_" + suffix, datatype="DERasterDataset",
@@ -1050,8 +1129,14 @@ class HojdmodellerFranLaserdata:
             )
 
         mem = p["memory_gb"].value
-        if mem is not None and mem < 0.5:
-            p["memory_gb"].setErrorMessage("Ange minst 0,5 GB.")
+        if mem is not None and mem < MIN_MEMORY_GB:
+            p["memory_gb"].setErrorMessage("Ange minst 0,5 GB, eller lämna tomt för automatiskt.")
+        elif mem is not None:
+            avail = _available_memory_gb()
+            if avail is not None and mem > avail:
+                p["memory_gb"].setWarningMessage(
+                    "Mer än det lediga arbetsminnet ({} GB). Windows börjar då skriva till disk "
+                    "och körningen blir mycket långsam.".format(_fmt_gb(avail)))
 
         raw = (p["raw_folder"].valueAsText or "").lower()
         if save and raw and any(h in raw for h in _SYNC_HINTS):
@@ -1088,12 +1173,18 @@ class HojdmodellerFranLaserdata:
                 p["out_workspace"].valueAsText,
                 p["prefix"].valueAsText.strip(),
                 p["cell_size"].value or DEFAULT_CELL_SIZE,
-                p["memory_gb"].value or DEFAULT_MEMORY_GB,
-                p["workers"].value or DEFAULT_WORKERS,
+                p["memory_gb"].value or None,
+                p["workers"].value or None,
                 messages,
             )
         except ValueError as exc:
-            messages.addErrorMessage(str(exc))
+            error = str(exc)
+        else:
+            error = None
+        # Utanför except-blocket, så att Pro inte skriver ut hela kedjan av
+        # undantag under det läsbara felmeddelandet.
+        if error:
+            messages.addErrorMessage(error)
             raise arcpy.ExecuteError
 
         names = [q.name for q in parameters]
@@ -1125,7 +1216,9 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
         raise ValueError("Ange en utdata-arbetsyta för rastren.")
     if raw_folder and not os.path.isdir(raw_folder):
         raise ValueError("Mappen för punktfiler finns inte: {}".format(raw_folder))
-    workers = max(1, min(8, int(workers)))
+    memory_gb, workers, auto_note = _resolve_resources(memory_gb, workers)
+    if auto_note:
+        messages.addMessage(auto_note)
 
     # Höjdskillnaden räknas ur DSM och DTM, så de skapas internt även om de
     # inte ska sparas.
@@ -1171,7 +1264,7 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
         workers = min(workers, len(blocks))
         messages.addMessage(
             "    {} block på upp till {:.0f} x {:.0f} m, {} åt gången, inom en minnesbudget "
-            "på {:g} GB.".format(len(blocks), side, side, workers, memory_gb))
+            "på {} GB.".format(len(blocks), side, side, workers, _fmt_gb(memory_gb)))
         if products and area_km2 > LARGE_AREA_KM2:
             out_gb = grid["width"] * grid["height"] * 4 * len(products) / 1e9
             messages.addWarningMessage(

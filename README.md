@@ -50,8 +50,8 @@ at a time, so its size is limited by disk space and time rather than RAM.
 | Utdata-arbetsyta för raster | project geodatabase | Geodatabase or folder, needed when a raster is ticked. In a folder the rasters are GeoTIFF |
 | Namnprefix | `laser` | Outputs are `<prefix>_dsm`, `<prefix>_dtm`, `<prefix>_hojdskillnad`. Existing ones are overwritten, with a warning in the dialog |
 | Cellstorlek (m) | 1 | Under Avancerat |
-| Minnesbudget (GB) | 4 | Under Avancerat. Roughly how much memory the tool may use on top of ArcGIS Pro. Sets the block size |
-| Block samtidigt | 4 | Under Avancerat. Blocks processed at the same time, 1 to 8, each in its own process. The memory budget is shared between them |
+| Minnesbudget (GB) | empty (automatic) | Under Avancerat. Roughly how much memory the tool may use on top of ArcGIS Pro. Sets the block size. Manual: at least 0.5 GB |
+| Block samtidigt | empty (automatic) | Under Avancerat. Blocks processed at the same time, each in its own process. The memory budget is shared between them. Manual: 1 to 32 |
 
 Every parameter has a tooltip in the dialog. The text lives in `TOOLTIPS` in the `.pyt`, which
 writes it to `LaserdataSkog.HojdmodellerFranLaserdata.pyt.xml` when the toolbox loads.
@@ -59,7 +59,9 @@ writes it to `LaserdataSkog.HojdmodellerFranLaserdata.pyt.xml` when the toolbox 
 ## Large areas
 
 The bounding box is split into square blocks sized so that each fits the memory budget divided by
-the number of parallel blocks, using the point density Lantmäteriet publishes per tile. Blocks
+the number of parallel blocks, using the point density Lantmäteriet publishes per tile. Blocks are
+also made small enough that there are at least as many as parallel processes, but not under
+250 m. Blocks
 that do not touch the polygon are skipped, unless point files are requested. Each block is read
 with a margin, so neighbouring blocks meet without a seam, and the blocks are mosaicked into the
 final rasters at the end.
@@ -71,6 +73,16 @@ Measured on a 2021 scan near Uppsala (about 2.3 million points per km²):
 | 9 km² | 2 GB | 1 | 72 s | 2.0 GB |
 | 9 km² | 2 GB | 4 | 38 s | 1.7 GB |
 | 25 km² | 4 GB | 4 | 75 s | 3.3 GB |
+
+Both memory and parallel blocks are automatic by default, decided on the machine that runs the
+tool when the run starts: half of the free RAM, leaving at least 2 GB for Pro and Windows, and one
+process per logical processor thread minus one, at most 16 and at most one per 0.75 GB of the
+budget. The log states what was chosen, and a typed process count that does not fit the budget is
+reduced. A worker needs about 135 bytes per point read plus about 120 MB (measured; the tool plans
+with 170 bytes and 150 MB). On a 16-thread machine with 34 GB free, 4 km² became 16 blocks of
+516 m, 15 at a time. Gains beyond 4 parallel blocks have not been measured against Lantmäteriet's
+server, hence the cap of 16. With point files there is one file per block and tile, so more
+processes give more, smaller files.
 
 Reading mostly waits on the network, which is why parallel blocks help. Each block costs about 1 s
 extra to open the remote files, so a very small budget, which gives many small blocks, is slower.
