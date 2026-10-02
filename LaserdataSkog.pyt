@@ -243,11 +243,22 @@ TOOLTIPS = {
         "ruta, så fler processer ger fler och mindre filer. 1 till 32."
     ),
     "raw_folder": (
-        "Mapp där punkterna sparas, en fil per block och ruta med namnet "
-        "<prefix>_<ruta>_<rad>_<kolumn>.laz eller .las. Punkterna är oförändrade: alla "
-        "klasser och attribut, samma punktformat, skala och offset som Lantmäteriets filer. "
-        "Varje punkt finns i exakt en fil. Filerna täcker områdets bounding box, inte hela "
-        "rutor. Undvik mappar som synkas till molnet, som OneDrive."
+        "Mapp där punkterna sparas. Som standard i en enda fil, <prefix>_punkter.laz eller "
+        ".las; annars en fil per block och ruta, se 'Samla punkterna i en fil'. Punkterna är "
+        "oförändrade: alla klasser och attribut, samma värden som i Lantmäteriets filer. "
+        "Filerna täcker områdets bounding box, inte hela rutor. Undvik mappar som synkas "
+        "till molnet, som OneDrive."
+    ),
+    "merge_points": (
+        "Markerat (standard) slås blockens punkter ihop till en fil, <prefix>_punkter.laz "
+        "eller .las, som sista steg för punkterna. En befintlig fil med samma namn skrivs "
+        "över. Sammanslagningen strömmar punkterna och behöver lite minne oavsett storlek, "
+        "men disken behöver tillfälligt plats för punkterna två gånger. Kommer punkterna från "
+        "rutor med olika punktformat används det senaste formatet, så inga attribut går "
+        "förlorade.\n"
+        "Avmarkerat blir det en fil per block och ruta, <prefix>_<ruta>_<rad>_<kolumn>, med "
+        "Lantmäteriets eget punktformat, skala och offset oförändrade. Rad räknas från norr. "
+        "Varje punkt finns i exakt en fil."
     ),
     "raw_format": (
         "Filformat för sparade punkter. LAZ är ungefär 5-7 gånger mindre men kan inte "
@@ -791,6 +802,11 @@ def _block_task(blk, token, need_dsm, need_dtm, raw_folder, raw_ext, prefix, wor
 # Utdata och metadata
 # =============================================================================
 
+def _merged_path(folder, prefix, ext):
+    """Den sammanslagna punktfilen: <mapp>/<prefix>_punkter.laz eller .las."""
+    return os.path.join(folder or "", "{}_punkter{}".format(prefix, ext))
+
+
 def _out_path(workspace, prefix, suffix):
     name = "{}_{}".format(prefix, suffix)
     is_gdb = str(workspace).lower().endswith(".gdb")
@@ -1027,6 +1043,8 @@ class HojdmodellerFranLaserdata:
         p_raw_fmt.filter.list = [RAW_LAZ, RAW_LAS]
         p_raw_fmt.value = RAW_LAZ
         p_raw_fmt.enabled = False
+        p_merge = checkbox("Samla punkterna i en fil", "merge_points", True)
+        p_merge.enabled = False
 
         # Optional i ramverket; krävs i updateMessages bara när ett raster är valt.
         p_ws = arcpy.Parameter(
@@ -1070,7 +1088,7 @@ class HojdmodellerFranLaserdata:
         ]
 
         return [p_mode, p_aoi, p_extent, p_key, p_secret, p_make_dsm, p_make_dtm, p_make_diff,
-                p_save_pts, p_raw, p_raw_fmt, p_ws, p_prefix, p_cell, p_mem, p_workers] + p_out
+                p_save_pts, p_raw, p_raw_fmt, p_merge, p_ws, p_prefix, p_cell, p_mem, p_workers] + p_out
 
     def isLicensed(self):
         return True
@@ -1083,6 +1101,7 @@ class HojdmodellerFranLaserdata:
         save = bool(p["save_points"].value)
         p["raw_folder"].enabled = save
         p["raw_format"].enabled = save
+        p["merge_points"].enabled = save
         rasters = any(p[n].value for n in ("make_dsm", "make_dtm", "make_diff"))
         p["out_workspace"].enabled = rasters
         p["cell_size"].enabled = rasters
@@ -1105,6 +1124,13 @@ class HojdmodellerFranLaserdata:
             p["out_workspace"].setErrorMessage("Ange var rastren ska sparas.")
         if save and not p["raw_folder"].valueAsText:
             p["raw_folder"].setErrorMessage("Ange en mapp för punktfilerna.")
+        elif save and p["merge_points"].value is not False:
+            pre = (p["prefix"].valueAsText or "").strip()
+            target = _merged_path(p["raw_folder"].valueAsText, pre,
+                                  RAW_EXT.get(p["raw_format"].valueAsText or RAW_LAZ, ".laz"))
+            if pre and os.path.exists(target):
+                p["merge_points"].setWarningMessage(
+                    "Skrivs över: {}".format(os.path.basename(target)))
 
         ws = p["out_workspace"].valueAsText
         prefix = (p["prefix"].valueAsText or "").strip()
@@ -1176,6 +1202,7 @@ class HojdmodellerFranLaserdata:
                 p["memory_gb"].value or None,
                 p["workers"].value or None,
                 messages,
+                merge_points=p["merge_points"].value is not False,
             )
         except ValueError as exc:
             error = str(exc)
@@ -1200,11 +1227,13 @@ class HojdmodellerFranLaserdata:
 # =============================================================================
 
 def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cell,
-         memory_gb, workers, messages):
+         memory_gb, workers, messages, merge_points=True):
     """
     aoi: polygon i SWEREF 99 TM (från _aoi_geometry eller _aoi_from_extent).
     products: de raster som ska sparas, en delmängd av SUFFIX_DSM/DTM/DIFF.
     raw_folder: mapp för punktfiler, eller None. Returnerar {suffix: sökväg}.
+    merge_points: slå ihop punktfilerna till <prefix>_punkter i raw_folder. Blocken
+    skrivs då först i körningens temp-mapp och slås ihop som ett eget steg.
 
     Området delas i block (se _plan_blocks) som bearbetas i `workers` trådar.
     Trådarna gör bara PDAL-arbete; höjdskillnad, mosaik, klippning och metadata
@@ -1234,10 +1263,17 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
               for s in products] + (["punktfiler"] if raw_folder else [])
     messages.addMessage("Skapar: {}.".format(", ".join(wanted)))
 
-    n_steps = 3 + (3 if products else 0) + (1 if need_diff else 0)
+    merge = bool(raw_folder) and merge_points
+    n_steps = 3 + (3 if products else 0) + (1 if need_diff else 0) + (1 if merge else 0)
     steps = _Steps(n_steps, messages)
     workdir = os.path.join(arcpy.env.scratchFolder, "lds_" + uuid.uuid4().hex[:8])
     os.makedirs(workdir)
+    # Blockens punktfiler: direkt i användarens mapp, eller i temp-mappen om de
+    # ska slås ihop till en fil efteråt.
+    block_raw = None
+    if raw_folder:
+        block_raw = os.path.join(workdir, "punkter") if merge else raw_folder
+        os.makedirs(block_raw, exist_ok=True)
     try:
         steps.next("söker rutor i Lantmäteriets STAC-katalog")
         wgs = aoi.projectAs(arcpy.SpatialReference(4326)).extent
@@ -1286,6 +1322,7 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
         parts = {SUFFIX_DSM: [], SUFFIX_DTM: [], SUFFIX_DIFF: []}
         diff_jobs = []
         n_points = n_ground = n_raw_files = 0
+        raw_files = []
         done_expected = 0.0
         t_blocks = time.time()
         sr = arcpy.SpatialReference(SWEREF99TM_WKID, RH2000_WKID)
@@ -1302,7 +1339,7 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
             for i in range(workers):
                 b = pending.pop(0)
                 running[i] = b
-                pool.submit(i, _block_task(b, token.get(), need_dsm, need_dtm, raw_folder,
+                pool.submit(i, _block_task(b, token.get(), need_dsm, need_dtm, block_raw,
                                            raw_ext, prefix, workdir))
             k = 0
             while running:
@@ -1322,7 +1359,7 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
                 if pending:
                     nb = pending.pop(0)
                     running[i] = nb
-                    pool.submit(i, _block_task(nb, token.get(), need_dsm, need_dtm, raw_folder,
+                    pool.submit(i, _block_task(nb, token.get(), need_dsm, need_dtm, block_raw,
                                                raw_ext, prefix, workdir))
 
                 res = reply["result"]
@@ -1330,6 +1367,7 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
                 n_points += res["points"]
                 n_ground += res["ground"]
                 n_raw_files += len(res["raw"])
+                raw_files.extend(res["raw"])
                 for suffix in (SUFFIX_DSM, SUFFIX_DTM):
                     if suffix in res:
                         parts[suffix].append(res[suffix])
@@ -1355,8 +1393,16 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
 
         if n_points == 0:
             raise ValueError("Inga punkter inom området.")
-        extra = ", {} punktfiler i {}".format(n_raw_files, raw_folder) if raw_folder else ""
+        if raw_folder and not merge:
+            extra = ", {} punktfiler i {}".format(n_raw_files, raw_folder)
+        elif raw_folder:
+            extra = ", {} punktfiler att slå ihop".format(n_raw_files)
+        else:
+            extra = ""
         steps.done("{} punkter inom området{}.".format(_fmt_count(n_points), extra))
+        if merge and raw_files:
+            _merge_raw_files(raw_files, _merged_path(raw_folder, prefix, raw_ext), raw_folder,
+                             workdir, steps, messages)
         if not products:
             messages.addMessage("Klart på {}.".format(_fmt_duration(time.time() - steps.t0)))
             return {}
@@ -1438,6 +1484,61 @@ def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cel
         except Exception:
             pass
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _merge_raw_files(raw_files, target, raw_folder, workdir, steps, messages):
+    """
+    Slå ihop blockens punktfiler till target i en arbetsprocess (PDAL körs
+    aldrig i Pro:s egen process). Om det misslyckas flyttas blockfilerna till
+    raw_folder i stället, så att inga hämtade punkter går förlorade.
+    """
+    files = [f for f, _n in raw_files]
+    expected = sum(n for _f, n in raw_files)
+    steps.next("slår ihop {} punktfiler till en fil, {} punkter".format(
+        len(files), _fmt_count(expected)))
+    pool = _WorkerPool(1, workdir)
+    reply, failed = None, True
+    try:
+        pool.submit(0, {"merge": {"files": files, "out": target.replace("\\", "/"),
+                                  "expected": expected}})
+        while reply is None:
+            got = pool.get(timeout=1.0)
+            if getattr(arcpy.env, "isCancelled", False):
+                raise ValueError("Avbrutet av användaren.")
+            if got is not None:
+                reply = got[1] or {"ok": False, "error": pool.log_tail(0)}
+        failed = False
+    finally:
+        pool.close(kill=failed)
+
+    res = reply.get("result") if reply.get("ok") else None
+    if res is None or res["count"] != expected:
+        why = reply.get("error", "") if res is None else \
+            "{} punkter i filen, {} väntade".format(_fmt_count(res["count"]), _fmt_count(expected))
+        for f in files:
+            shutil.move(f, os.path.join(raw_folder, os.path.basename(f)))
+        if res is not None and os.path.exists(target):
+            os.remove(target)
+        messages.addWarningMessage(
+            "Punktfilerna kunde inte slås ihop ({}). De {} blockfilerna ligger i stället i "
+            "{}.".format(why.strip().splitlines()[-1] if why.strip() else "okänt fel",
+                         len(files), raw_folder))
+        steps.done()
+        return
+    for f in files:
+        os.remove(f)
+    size = os.path.getsize(target)
+    note = "{} punkter i {} ({} MB)".format(_fmt_count(res["count"]), target,
+                                            _fmt_count(size / 1e6))
+    if len(res["formats"]) > 1:
+        note += ", punktformat {} från rutor med format {}".format(
+            res["dataformat_id"], ", ".join(str(f) for f in res["formats"]))
+    steps.done(note + ".")
+    if not res["exact"]:
+        messages.addWarningMessage(
+            "Rutorna har offset som inte går jämnt upp i skalan. Koordinaterna i den "
+            "sammanslagna filen kan avvika med mindre än en skalenhet (normalt 1 cm). Avmarkera "
+            "'Samla punkterna i en fil' för oförändrade koordinater.")
 
 
 def _block_diff(res, blk, workdir):

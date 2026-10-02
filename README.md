@@ -47,6 +47,7 @@ at a time, so its size is limited by disk space and time rather than RAM.
 | Punktfiler (LAZ/LAS) | off | Checkbox. Can be the only choice |
 | Mapp för punktfiler | - | Enabled when Punktfiler is ticked. See "Point files" below |
 | Format för punktfiler | LAZ | LAZ is 5-7 times smaller but cannot be opened in Pro on a Basic licence. LAS can be added straight to a map |
+| Samla punkterna i en fil | on | Enabled when Punktfiler is ticked. One file `<prefix>_punkter.laz` (or `.las`), overwritten with a warning. Unticked: one file per block and tile. See "Point files" |
 | Utdata-arbetsyta för raster | project geodatabase | Geodatabase or folder, needed when a raster is ticked. In a folder the rasters are GeoTIFF |
 | Namnprefix | `laser` | Outputs are `<prefix>_dsm`, `<prefix>_dtm`, `<prefix>_hojdskillnad`. Existing ones are overwritten, with a warning in the dialog |
 | Cellstorlek (m) | 1 | Under Avancerat |
@@ -81,8 +82,8 @@ budget. The log states what was chosen, and a typed process count that does not 
 reduced. A worker needs about 135 bytes per point read plus about 120 MB (measured; the tool plans
 with 170 bytes and 150 MB). On a 16-thread machine with 34 GB free, 4 km² became 16 blocks of
 516 m, 15 at a time. Gains beyond 4 parallel blocks have not been measured against Lantmäteriet's
-server, hence the cap of 16. With point files there is one file per block and tile, so more
-processes give more, smaller files.
+server, hence the cap of 16. With point files and "Samla punkterna i en fil" unticked there is
+one file per block and tile, so more processes give more, smaller files.
 
 Reading mostly waits on the network, which is why parallel blocks help. Each block costs about 1 s
 extra to open the remote files, so a very small budget, which gives many small blocks, is slower.
@@ -98,11 +99,21 @@ area.
 
 ## Point files
 
-One file per block and tile: `<prefix>_<tile>_<row>_<column>.laz` or `.las`, rows counted from
-the north. The files contain the source data unchanged: every point inside the area's bounding
-box, all classes including noise, all attributes, with Lantmäteriet's own point format, scale,
-offset and header. Every point is in exactly one file, also where blocks meet. Verified against
-a single-block run: same points, every field equal, no duplicates.
+The points are the source data unchanged: every point inside the area's bounding box, all
+classes including noise, all attributes. Every point is written exactly once, also where blocks
+meet. Verified against a single-block run: same points, every field equal, no duplicates.
+
+**One file (default).** The blocks are written to the scratch folder first and then merged into
+`<prefix>_punkter.laz` or `.las` as a separate step. The merge streams the points, so it needs
+little memory at any size (9 million points took under 200 MB), but the disk temporarily needs
+room for the points twice. Tiles from different scans can have different point formats and
+offsets. The merged file therefore gets the newest point format and the finest scale, and the
+first tile's offset, so no attribute is lost and every coordinate is unchanged (verified with
+mixed formats and offsets). The tool warns in the rare case where offsets do not differ by a
+whole number of scale units. If the merge fails, the block files are moved to the folder instead.
+
+**One file per block and tile** (box unticked): `<prefix>_<tile>_<row>_<column>.laz` or `.las`,
+rows counted from the north, each with Lantmäteriet's own point format, scale, offset and header.
 
 ## Output
 
