@@ -2,7 +2,7 @@
 """
 laserdata_worker.py
 
-PDAL-delen av LaserdataSkog.pyt: läser ett block ur Lantmäteriets COPC-filer,
+PDAL-delen av LaserdataHojdmodeller.pyt: läser ett block ur Lantmäteriets COPC-filer,
 sparar punktfiler och skriver blockets DSM och DTM som GeoTIFF.
 
 Körs som egen process, en per samtidigt block, och importerar aldrig arcpy.
@@ -18,7 +18,7 @@ Uppgift:  {"block": {...}, "token": "...", "need_dsm": bool, "need_dtm": bool,
            "raw_folder": str|null, "raw_ext": ".laz", "prefix": "...", "workdir": "..."}
 Svar:     {"ok": true, "result": {...}} eller {"ok": false, "error": "traceback"}
 
-LaserdataSkog.pyt importerar konstanterna och process_block härifrån, så att
+LaserdataHojdmodeller.pyt importerar konstanterna och process_block härifrån, så att
 de bara finns på ett ställe.
 """
 

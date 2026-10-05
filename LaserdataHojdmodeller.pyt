@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-LaserdataSkog.pyt
+LaserdataHojdmodeller.pyt
 
 Skapar tre höjdraster för ett intresseområde ur Lantmäteriets Laserdata
 Nedladdning, skog: ytmodell (DSM), markmodell (DTM) och höjdskillnaden mellan
@@ -50,7 +50,7 @@ grannceller. DTM = markpunkter trianguleras (TIN) och TIN:ens höjd i
 cellmitten används, alltså utan luckor.
 
 Verktygstips (parameterförklaringar) skrivs till
-LaserdataSkog.HojdmodellerFranLaserdata.pyt.xml från TOOLTIPS nedan när
+LaserdataHojdmodeller.HojdmodellerFranLaserdata.pyt.xml från TOOLTIPS nedan när
 verktygslådan laddas, så att texten bara finns på ett ställe.
 
 Krav: ArcGIS Pro 3.x. arcpy, numpy, pdal och certifi ingår i arcgispro-py3.
@@ -100,7 +100,7 @@ TOKEN_URL = "https://apimanager.lantmateriet.se/oauth2/token"
 COLLECTION = "dsm-skoglig-copc"
 GEOTORGET_URL = "https://geotorget.lantmateriet.se/geodataprodukter/laserdata-nedladdning-skog-api"
 
-USER_AGENT = "arcgis-laserdata-skog/1.1"
+USER_AGENT = "arcgis-laserdata-hojdmodeller/1.1"
 HTTP_TIMEOUT = 60
 HTTP_RETRIES = 3
 
@@ -950,7 +950,7 @@ def _write_raster_metadata(path, suffix, tiles, run):
         "<th>Punktmoln senast ändrat</th></tr>{rows}</table>"
         "<p><b>Bearbetning:</b> Cellstorlek {cell:g} m. {npts} punkter lästa inom "
         "områdets utbredning, varav {nground} markpunkter. Klippt till intresseområdet. "
-        "Skapad {created} med verktyget {tool} (arcgis-laserdata-skog).</p>"
+        "Skapad {created} med verktyget {tool} (arcgis-laserdata-hojdmodeller).</p>"
         "<p><b>Koordinatsystem:</b> SWEREF 99 TM (EPSG:3006), höjder i meter i RH 2000 "
         "(EPSG:5613).</p>"
         "<p><b>Utbredning:</b> X {x0:.0f} - {x1:.0f}, Y {y0:.0f} - {y1:.0f}.</p>"
@@ -1033,8 +1033,8 @@ def _write_tool_metadata(tool_cls, toolbox_alias):
 
 class Toolbox:
     def __init__(self):
-        self.label = "Lantmäteriet Laserdata Skog"
-        self.alias = "laserdata_skog"
+        self.label = "Lantmäteriet Laserdata: höjdmodeller"
+        self.alias = "laserdata_hojdmodeller"
         self.tools = [HojdmodellerFranLaserdata]
         _write_tool_metadata(HojdmodellerFranLaserdata, self.alias)
 

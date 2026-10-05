@@ -1,4 +1,4 @@
-# Laserdata Skog
+# Laserdata höjdmodeller
 
 ArcGIS Pro Python toolbox that builds height rasters for an area of interest from
 Lantmäteriet's Laserdata Nedladdning, skog, and optionally saves the points as LAZ or LAS.
@@ -28,9 +28,9 @@ at a time, so its size is limited by disk space and time rather than RAM.
 
 ## Install
 
-1. Clone or download this repo. Keep `LaserdataSkog.pyt` and `laserdata_worker.py` in the same
+1. Clone or download this repo. Keep `LaserdataHojdmodeller.pyt` and `laserdata_worker.py` in the same
    folder; the toolbox runs the worker file in separate processes.
-2. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `LaserdataSkog.pyt`.
+2. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `LaserdataHojdmodeller.pyt`.
 3. Open Lantmäteriet Laserdata Skog, Höjdmodeller från Laserdata Skog.
 
 ## Parameters
@@ -55,7 +55,7 @@ at a time, so its size is limited by disk space and time rather than RAM.
 | Block samtidigt | empty (automatic) | Under Avancerat. Blocks processed at the same time, each in its own process. The memory budget is shared between them. Manual: 1 to 32 |
 
 Every parameter has a tooltip in the dialog. The text lives in `TOOLTIPS` in the `.pyt`, which
-writes it to `LaserdataSkog.HojdmodellerFranLaserdata.pyt.xml` when the toolbox loads.
+writes it to `LaserdataHojdmodeller.HojdmodellerFranLaserdata.pyt.xml` when the toolbox loads.
 
 ## Large areas
 
