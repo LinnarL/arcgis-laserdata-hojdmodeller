@@ -141,8 +141,12 @@ MAX_WORKERS = 16
 # Varna över denna yta: utdata blir stora och körningen lång.
 LARGE_AREA_KM2 = 200
 
-AOI_POLYGONS = "Polygoner i ett lager"
+AOI_POLYGONS = "Polygoner (lager eller ritade i kartan)"
 AOI_EXTENT = "Utbredning (kartvy, lager eller koordinater)"
+# Tidigare etikett. Skript kan skicka den; updateParameters byter den mot
+# AOI_POLYGONS innan ValueList-kontrollen (annars ERROR 000800).
+AOI_POLYGONS_OLD = "Polygoner i ett lager"
+AOI_EMPTY = "Rita minst en polygon i kartan eller välj ett polygonlager."
 
 RAW_LAZ = "LAZ (komprimerad)"
 RAW_LAS = "LAS (okomprimerad, kan öppnas i ArcGIS Pro)"
@@ -161,15 +165,19 @@ TOOL_SUMMARY = (
 # Verktygstips per parameter, visas i verktygsdialogen. Se _write_tool_metadata.
 TOOLTIPS = {
     "aoi_mode": (
-        "Hur området avgränsas. 'Polygoner i ett lager' klipper resultatet till själva "
-        "polygonerna. 'Utbredning' ger en rektangel: aktuell kartvy, utbredningen av ett "
-        "lager, en ritad rektangel eller inskrivna koordinater."
+        "Hur området avgränsas. 'Polygoner' använder polygoner ur ett lager eller polygoner "
+        "som du ritar i kartan, och klipper resultatet till själva polygonerna. 'Utbredning' "
+        "ger en rektangel: aktuell kartvy, utbredningen av ett lager, en ritad rektangel "
+        "eller inskrivna koordinater."
     ),
     "aoi": (
-        "Polygonlager som avgränsar området. Alla objekt i lagret slås ihop, eller bara de "
-        "valda om det finns ett urval. Lagret kan ha vilket koordinatsystem som helst. "
-        "Punkter hämtas inom polygonernas utbredning (bounding box), rastren klipps sedan "
-        "till själva polygonerna."
+        "Polygoner som avgränsar området. Välj ett polygonlager i listan, eller rita en eller "
+        "flera polygoner i kartan med ritverktyget bredvid fältet (dubbelklicka för att "
+        "avsluta en polygon). Från ett lager används alla objekt, eller bara de valda om "
+        "lagret har ett urval. Alla polygoner slås ihop till ett område. Lagret kan ha "
+        "vilket koordinatsystem som helst. Punkter hämtas inom polygonernas utbredning "
+        "(bounding box), rastren klipps sedan till själva polygonerna. Verktyget går inte att "
+        "köra förrän det finns minst en polygon."
     ),
     "aoi_extent": (
         "Rektangel som avgränsar området. I listan kan du välja kartvyns aktuella "
@@ -421,20 +429,72 @@ def _stac_search(bbox_wgs84):
 # Geometri
 # =============================================================================
 
-def _aoi_geometry(aoi_layer):
-    """Alla (valda) polygoner i lagret, sammanslagna, i SWEREF 99 TM."""
-    sr_in = arcpy.Describe(aoi_layer).spatialReference
+def _polygon_schema():
+    """
+    Tom polygonfeatureklass i SWEREF 99 TM, standardvärde för Feature Set-
+    parametern så att dialogens ritverktyg ritar polygoner. Unikt namn i memory:
+    memory-arbetsytan delas av hela Pro-sessionen, och Exists/Delete på ett fast
+    namn har gett SQL-fel där.
+    """
+    name = "aoi_schema_{}".format(uuid.uuid4().hex[:12])
+    arcpy.management.CreateFeatureclass("memory", name, "POLYGON",
+                                        spatial_reference=arcpy.SpatialReference(SWEREF99TM_WKID))
+    return "memory/" + name
+
+
+def _is_layer(value):
+    """
+    Sant för ett Layer-objekt (ett lager valt i listan). arcpy.mp har ingen
+    Layer-klass att jämföra med (AttributeError), klassen ligger i arcpy._mp.
+    """
+    return type(value).__name__ == "Layer"
+
+
+def _has_features(value):
+    """
+    True om värdet har minst ett objekt (ett lagers urval räknas), False om det
+    är tomt, None om det inte går att läsa. Läser bara första raden, så det är
+    billigt även för stora lager.
+    """
+    try:
+        with arcpy.da.SearchCursor(value, ["OID@"]) as cur:
+            return next(iter(cur), None) is not None
+    except Exception:
+        return None
+
+
+def _aoi_geometry(value, messages=None):
+    """
+    Alla polygoner i parametervärdet, sammanslagna, i SWEREF 99 TM.
+
+    value är det som Feature Set-parametern (GPFeatureRecordSetLayer) ger i
+    execute(): ett Layer-objekt när ett lager valts (då läses bara urvalet om
+    det finns ett), ett record set med polygoner ritade i kartan, eller en
+    featureklass som sökväg. SearchCursor och Describe fungerar på alla tre.
+    Standardvärdet är en tom featureklass, så "inget valt" är noll polygoner,
+    inte None.
+    """
+    if _has_features(value) is False:
+        raise ValueError(AOI_EMPTY)
+    # Kontrollera koordinatsystemet innan något omprojiceras: utan det skulle
+    # polygonerna tyst läsas som om de redan vore i SWEREF 99 TM.
+    sr_in = arcpy.Describe(value).spatialReference
     if sr_in is None or not (sr_in.factoryCode or sr_in.exportToString()):
         raise ValueError("Intresseområdet saknar koordinatsystem.")
     sr = arcpy.SpatialReference(SWEREF99TM_WKID)
     geom = None
-    with arcpy.da.SearchCursor(aoi_layer, ["SHAPE@"], spatial_reference=sr) as cur:
+    n = 0
+    with arcpy.da.SearchCursor(value, ["SHAPE@"], spatial_reference=sr) as cur:
         for (shape,) in cur:
             if shape is None or shape.area <= 0:
                 continue
+            n += 1
             geom = shape if geom is None else geom.union(shape)
     if geom is None:
         raise ValueError("Intresseområdet innehåller inga polygoner med yta.")
+    if messages is not None:
+        messages.addMessage("Intresseområde: {} polygon(er) i {}, sammanlagt {} ha.".format(
+            n, sr_in.name, "{:.1f}".format(geom.area / 1e4).replace(".", ",")))
     return geom
 
 
@@ -998,11 +1058,14 @@ class HojdmodellerFranLaserdata:
         p_mode.value = AOI_POLYGONS
 
         # Båda är Optional i ramverket; updateMessages kräver den som valts.
+        # Feature Set: ett lager i listan eller polygoner ritade i kartan. Den
+        # tomma polygonmallen gör att ritverktyget ritar polygoner.
         p_aoi = arcpy.Parameter(
-            displayName="Intresseområde (polygoner)", name="aoi", datatype="GPFeatureLayer",
-            parameterType="Optional", direction="Input",
+            displayName="Intresseområde (polygoner)", name="aoi",
+            datatype="GPFeatureRecordSetLayer", parameterType="Optional", direction="Input",
         )
         p_aoi.filter.list = ["Polygon"]
+        p_aoi.value = _polygon_schema()
 
         p_extent = arcpy.Parameter(
             displayName="Utbredning", name="aoi_extent", datatype="GPExtent",
@@ -1095,6 +1158,8 @@ class HojdmodellerFranLaserdata:
 
     def updateParameters(self, parameters):
         p = {q.name: q for q in parameters}
+        if p["aoi_mode"].valueAsText == AOI_POLYGONS_OLD:
+            p["aoi_mode"].value = AOI_POLYGONS
         by_extent = p["aoi_mode"].valueAsText == AOI_EXTENT
         p["aoi"].enabled = not by_extent
         p["aoi_extent"].enabled = by_extent
@@ -1116,7 +1181,12 @@ class HojdmodellerFranLaserdata:
             if not p["aoi_extent"].valueAsText:
                 p["aoi_extent"].setErrorMessage("Ange en utbredning.")
         elif not p["aoi"].valueAsText:
-            p["aoi"].setErrorMessage("Ange ett polygonlager.")
+            p["aoi"].setErrorMessage(AOI_EMPTY)
+        elif not _is_layer(p["aoi"].value) and _has_features(p["aoi"].value) is False:
+            # Tom polygonmall eller tom featureklass. Ett valt lager kontrolleras
+            # först vid körningen: det kan vara en tjänst, och updateMessages körs
+            # vid varje ändring i dialogen.
+            p["aoi"].setErrorMessage(AOI_EMPTY)
 
         if not chosen and not save:
             p["make_dsm"].setErrorMessage("Välj minst en sak att skapa.")
@@ -1187,8 +1257,8 @@ class HojdmodellerFranLaserdata:
                                        messages)
             else:
                 if not p["aoi"].valueAsText:
-                    raise ValueError("Ange ett polygonlager.")
-                aoi = _aoi_geometry(p["aoi"].value)
+                    raise ValueError(AOI_EMPTY)
+                aoi = _aoi_geometry(p["aoi"].value, messages)
             outputs = _run(
                 aoi,
                 (p["consumer_key"].valueAsText or "").strip(),

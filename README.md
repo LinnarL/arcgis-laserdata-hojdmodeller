@@ -37,8 +37,8 @@ at a time, so its size is limited by disk space and time rather than RAM.
 
 | Parameter | Default | Notes |
 |---|---|---|
-| Avgränsa området med | Polygoner i ett lager | Choose between a polygon layer and an extent |
-| Intresseområde (polygoner) | - | Polygon layer in any coordinate system. All features, or the selection, are merged, and the rasters are clipped to the shapes |
+| Avgränsa området med | Polygoner (lager eller ritade i kartan) | Choose between polygons (from a layer or drawn in the map) and an extent. Scripts may still pass the old value `Polygoner i ett lager` |
+| Intresseområde (polygoner) | empty | Pick a polygon layer, or draw polygons in the map with the parameter's draw tool. A layer can be in any coordinate system. All features, or the layer's selection, are merged, and the rasters are clipped to the shapes. The tool will not run until there is at least one polygon |
 | Utbredning | - | Rectangle: current display extent, a layer's extent, a drawn rectangle or typed coordinates. Typed coordinates are read in the active map's coordinate system; the log says which one was used |
 | Consumer key / Consumer secret | - | Under Inloggning. The secret is a hidden field |
 | DSM (ytmodell) | on | Checkbox |
